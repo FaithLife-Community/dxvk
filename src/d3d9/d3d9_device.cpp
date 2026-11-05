@@ -662,6 +662,8 @@ namespace dxvk {
       const bool isExtended = m_d3dCompatibility.test(D3DCompatibility::D3D9Ex);
       const Com<D3D9Texture2D> texture = new D3D9Texture2D(this, &desc, isExtended, pSharedHandle);
 
+      // The application's memory backs the texture from now on, not just its initial contents.
+      texture->GetCommonTexture()->SetUserMemory(initialData);
       m_initializer->InitTexture(texture->GetCommonTexture(), initialData);
       *ppTexture = texture.ref();
 
@@ -1202,7 +1204,36 @@ namespace dxvk {
     dstTexInfo->SetNeedsReadback(dst->GetSubresource(), true);
     TrackTextureMappingBufferSequenceNumber(dstTexInfo, dst->GetSubresource());
 
+    if (unlikely(dstTexInfo->GetUserMemory() != nullptr))
+      SyncUserMemoryAfterReadback(dstTexInfo);
+
     return D3D_OK;
+  }
+
+
+  void D3D9DeviceEx::SyncUserMemoryAfterReadback(D3D9CommonTexture* pTexture) {
+    // Applications that create a texture on top of their own memory may read
+    // the result of GetRenderTargetData straight from that memory without
+    // locking the texture, so the copy has to be complete when we return.
+    if (pTexture->GetBuffer() == nullptr)
+      return;
+
+    WaitForResource(*pTexture->GetBuffer(), pTexture->GetMappingBufferSequenceNumber(0), D3DLOCK_READONLY);
+    pTexture->SetNeedsReadback(0, false);
+
+    MapTexture(pTexture, 0);
+    pTexture->CopyDataToUserMemory();
+  }
+
+
+  void D3D9DeviceEx::SyncUserMemoryBeforeAccess(D3D9CommonTexture* pTexture) {
+    // The application may have written to its memory directly.
+    // Make sure the GPU is done reading our copy before replacing it.
+    if (pTexture->GetBuffer() != nullptr)
+      WaitForResource(*pTexture->GetBuffer(), pTexture->GetMappingBufferSequenceNumber(0), 0);
+
+    MapTexture(pTexture, 0);
+    pTexture->CopyUserMemoryToData();
   }
 
 
@@ -4389,6 +4420,9 @@ namespace dxvk {
 
       const bool isExtended = m_d3dCompatibility.test(D3DCompatibility::D3D9Ex);
       const Com<D3D9Surface> surface = new D3D9Surface(this, &desc, isExtended, nullptr, pSharedHandle);
+
+      // The application's memory backs the surface from now on, not just its initial contents.
+      surface->GetCommonTexture()->SetUserMemory(initialData);
       m_initializer->InitTexture(surface->GetCommonTexture(), initialData);
       *ppSurface = surface.ref();
 
@@ -5098,6 +5132,10 @@ namespace dxvk {
       pLockedBox->SlicePitch = pLockedBox->RowPitch * blockCount.height;
     }
 
+    // The application's own memory is the real storage of the resource.
+    if (unlikely(pResource->GetUserMemory() != nullptr))
+      SyncUserMemoryBeforeAccess(pResource);
+
     pResource->SetLocked(Subresource, true);
 
     // Make sure the amount of mapped texture memory stays below the threshold.
@@ -5165,6 +5203,10 @@ namespace dxvk {
 
     MapTexture(pResource, Subresource); // Add it to the list of mapped resources
     pResource->SetLocked(Subresource, false);
+
+    // Writes made through LockRect have to show up in the application's own memory.
+    if (unlikely(pResource->GetUserMemory() != nullptr))
+      pResource->CopyDataToUserMemory();
 
     // Flush image contents from staging if we aren't read only
     // and we aren't deferring for managed.
@@ -5269,6 +5311,10 @@ namespace dxvk {
       WaitForResource(*buffer, pSrcTexture->GetMappingBufferSequenceNumber(SrcSubresource), D3DLOCK_READONLY);
     }
     pSrcTexture->SetNeedsReadback(SrcSubresource, false);
+
+    // Pick up whatever the application wrote into its own memory.
+    if (unlikely(pSrcTexture->GetUserMemory() != nullptr && !pSrcTexture->GetLocked(SrcSubresource)))
+      SyncUserMemoryBeforeAccess(pSrcTexture);
 
     if (likely(convertFormat.FormatType == D3D9ConversionFormat_None)) {
       // The texture does not use a format that needs to be converted in a compute shader.

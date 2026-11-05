@@ -478,6 +478,9 @@ namespace dxvk {
     dstTexInfo->SetNeedsReadback(dst->GetSubresource(), true);
     m_parent->TrackTextureMappingBufferSequenceNumber(dstTexInfo, dst->GetSubresource());
 
+    if (unlikely(dstTexInfo->GetUserMemory() != nullptr))
+      m_parent->SyncUserMemoryAfterReadback(dstTexInfo);
+
     return D3D_OK;
   }
 
