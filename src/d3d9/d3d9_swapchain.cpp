@@ -180,11 +180,23 @@ namespace dxvk {
       }
     }
 
+    // A windowed present to part of the window must leave the rest of the
+    // window alone, but a Vulkan swap chain image has to be redrawn in full.
+    // Keep a copy of what the window shows, update the presented region in
+    // it and present all of it. This keeps applications that present dirty
+    // regions every frame, such as WPF, off the slow GDI path.
+    const bool partialPresent = m_partialCopy && !SwapWithFrontBuffer();
+
+    if (partialPresent || m_wctx->windowCopy != nullptr) {
+      if (!UpdateWindowCopy()) {
+        m_wctx->windowCopy = nullptr;
+
 #ifdef _WIN32
-    const bool useGDIFallback = m_partialCopy && !SwapWithFrontBuffer();
-    if (useGDIFallback)
-      return PresentImageGDI(m_window);
+        if (partialPresent)
+          return PresentImageGDI(m_window);
 #endif
+      }
+    }
 
     try {
       UpdateWindowedRefreshRate();
@@ -856,8 +868,27 @@ namespace dxvk {
     // Retrieve the image and image view to present
     VkResult status = VK_SUCCESS;
 
-    Rc<DxvkImage> swapImage = m_backBuffers[0]->GetCommonTexture()->GetImage();
     Rc<DxvkImageView> swapImageView = m_backBuffers[0]->GetCommonTexture()->GetSampleView(false);
+    RECT presentSrcRect = m_srcRect;
+    RECT presentDstRect = m_dstRect;
+
+    if (m_wctx->windowCopy != nullptr) {
+      DxvkImageViewKey viewInfo;
+      viewInfo.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+      viewInfo.usage      = VK_IMAGE_USAGE_SAMPLED_BIT;
+      viewInfo.format     = m_wctx->windowCopy->info().format;
+      viewInfo.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
+      viewInfo.mipIndex   = 0u;
+      viewInfo.mipCount   = 1u;
+      viewInfo.layerIndex = 0u;
+      viewInfo.layerCount = 1u;
+
+      VkExtent3D extent = m_wctx->windowCopy->info().extent;
+
+      swapImageView  = m_wctx->windowCopy->createView(viewInfo);
+      presentSrcRect = { 0, 0, LONG(extent.width), LONG(extent.height) };
+      presentDstRect = presentSrcRect;
+    }
 
     // Presentation semaphores and WSI swap chain image
     PresenterSync sync = { };
@@ -867,12 +898,12 @@ namespace dxvk {
 
     if (status >= 0 && status != VK_NOT_READY) {
       VkRect2D srcRect = {
-        {  int32_t(m_srcRect.left),                    int32_t(m_srcRect.top)                    },
-        { uint32_t(m_srcRect.right - m_srcRect.left), uint32_t(m_srcRect.bottom - m_srcRect.top) } };
+        {  int32_t(presentSrcRect.left),                         int32_t(presentSrcRect.top)                         },
+        { uint32_t(presentSrcRect.right - presentSrcRect.left), uint32_t(presentSrcRect.bottom - presentSrcRect.top) } };
 
       VkRect2D dstRect = {
-        {  int32_t(m_dstRect.left),                    int32_t(m_dstRect.top)                    },
-        { uint32_t(m_dstRect.right - m_dstRect.left), uint32_t(m_dstRect.bottom - m_dstRect.top) } };
+        {  int32_t(presentDstRect.left),                         int32_t(presentDstRect.top)                         },
+        { uint32_t(presentDstRect.right - presentDstRect.left), uint32_t(presentDstRect.bottom - presentDstRect.top) } };
 
       // Bump frame ID
       m_wctx->frameId += 1;
@@ -1001,6 +1032,125 @@ namespace dxvk {
       backBuffer->ClearContainer();
 
     m_backBuffers.clear();
+
+    for (auto& entry : m_presenters)
+      entry.second.windowCopy = nullptr;
+  }
+
+
+  bool D3D9SwapChainEx::UpdateWindowCopy() {
+    Rc<DxvkImage> srcImage = m_backBuffers[0]->GetCommonTexture()->GetImage();
+    const DxvkImageCreateInfo& srcInfo = srcImage->info();
+
+    if (srcInfo.sampleCount != VK_SAMPLE_COUNT_1_BIT)
+      return false;
+
+    VkExtent2D extent = m_swapchainExtent;
+
+    auto isInside = [] (const RECT& rect, uint32_t width, uint32_t height) {
+      return rect.left >= 0 && rect.top >= 0
+          && rect.left < rect.right && rect.top < rect.bottom
+          && rect.right <= LONG(width) && rect.bottom <= LONG(height);
+    };
+
+    if (!isInside(m_srcRect, srcInfo.extent.width, srcInfo.extent.height)
+     || !isInside(m_dstRect, extent.width, extent.height))
+      return false;
+
+    Rc<DxvkImage>& windowCopy = m_wctx->windowCopy;
+    bool initialize = false;
+
+    if (windowCopy == nullptr
+     || windowCopy->info().format       != srcInfo.format
+     || windowCopy->info().extent.width  != extent.width
+     || windowCopy->info().extent.height != extent.height) {
+      DxvkImageCreateInfo info;
+      info.type        = VK_IMAGE_TYPE_2D;
+      info.format      = srcInfo.format;
+      info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      info.extent      = { extent.width, extent.height, 1u };
+      info.numLayers   = 1u;
+      info.mipLevels   = 1u;
+      info.usage       = VK_IMAGE_USAGE_SAMPLED_BIT
+                       | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                       | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+      info.stages      = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                       | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                       | VK_PIPELINE_STAGE_TRANSFER_BIT;
+      info.access      = VK_ACCESS_SHADER_READ_BIT
+                       | VK_ACCESS_TRANSFER_WRITE_BIT
+                       | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                       | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+      info.tiling      = VK_IMAGE_TILING_OPTIMAL;
+      info.layout      = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      info.colorSpace  = srcInfo.colorSpace;
+      info.debugName   = "Window copy";
+
+      windowCopy = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      initialize = true;
+    }
+
+    DxvkImageViewKey dstViewInfo;
+    dstViewInfo.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+    dstViewInfo.usage      = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    dstViewInfo.format     = windowCopy->info().format;
+    dstViewInfo.aspects    = VK_IMAGE_ASPECT_COLOR_BIT;
+    dstViewInfo.mipIndex   = 0u;
+    dstViewInfo.mipCount   = 1u;
+    dstViewInfo.layerIndex = 0u;
+    dstViewInfo.layerCount = 1u;
+
+    // Apply the back buffer's swizzle so that formats without
+    // alpha end up with an opaque alpha channel in the copy.
+    DxvkImageViewKey srcViewInfo = dstViewInfo;
+    srcViewInfo.usage         = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    srcViewInfo.format        = srcInfo.format;
+    srcViewInfo.packedSwizzle = DxvkImageViewKey::packSwizzle(
+      m_backBuffers[0]->GetCommonTexture()->GetMapping().Swizzle);
+
+    auto toOffsets = [] (const RECT& rect, std::array<VkOffset3D, 2>& offsets) {
+      offsets[0] = VkOffset3D { int32_t(rect.left),  int32_t(rect.top),    0 };
+      offsets[1] = VkOffset3D { int32_t(rect.right), int32_t(rect.bottom), 1 };
+    };
+
+    auto filterFor = [] (const RECT& src, const RECT& dst) {
+      bool stretch = src.right - src.left != dst.right - dst.left
+                  || src.bottom - src.top != dst.bottom - dst.top;
+      return stretch ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    };
+
+    // A new copy starts out with the whole back buffer, which is what the
+    // window shows for the swap effects that can get here (COPY, or DISCARD
+    // with a single back buffer), where the back buffer keeps its contents.
+    RECT fullSrc = { 0, 0, LONG(srcInfo.extent.width), LONG(srcInfo.extent.height) };
+    RECT fullDst = { 0, 0, LONG(extent.width), LONG(extent.height) };
+
+    std::array<VkOffset3D, 2> initSrcOffsets, initDstOffsets, srcOffsets, dstOffsets;
+    toOffsets(fullSrc, initSrcOffsets);
+    toOffsets(fullDst, initDstOffsets);
+    toOffsets(m_srcRect, srcOffsets);
+    toOffsets(m_dstRect, dstOffsets);
+
+    m_parent->EmitCs([
+      cDstView        = windowCopy->createView(dstViewInfo),
+      cSrcView        = srcImage->createView(srcViewInfo),
+      cInitialize     = initialize,
+      cInitSrcOffsets = initSrcOffsets,
+      cInitDstOffsets = initDstOffsets,
+      cInitFilter     = filterFor(fullSrc, fullDst),
+      cSrcOffsets     = srcOffsets,
+      cDstOffsets     = dstOffsets,
+      cFilter         = filterFor(m_srcRect, m_dstRect)
+    ] (DxvkContext* ctx) {
+      if (cInitialize) {
+        ctx->initImage(cDstView->image(), VK_IMAGE_LAYOUT_UNDEFINED);
+        ctx->blitImageView(cDstView, cInitDstOffsets.data(), cSrcView, cInitSrcOffsets.data(), cInitFilter);
+      }
+
+      ctx->blitImageView(cDstView, cDstOffsets.data(), cSrcView, cSrcOffsets.data(), cFilter);
+    });
+
+    return true;
   }
 
 

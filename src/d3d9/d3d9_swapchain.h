@@ -57,6 +57,10 @@ namespace dxvk {
     Rc<sync::Fence>                frameLatencySignal;
 
     uint32_t                       deviceResetCounter = 0u;
+
+    // What the window currently shows, kept for presents
+    // that only update part of the window. See UpdateWindowCopy.
+    Rc<DxvkImage>                  windowCopy;
   };
 
   using D3D9SwapChainExBase = D3D9DeviceChild<IDirect3DSwapChain9Ex>;
@@ -191,6 +195,8 @@ namespace dxvk {
     D3D9VkExtSwapchain m_swapchainExt;
 
     void PresentImage(UINT PresentInterval);
+
+    bool UpdateWindowCopy();
 
     Rc<Presenter> CreatePresenter(
             HWND                Window,
