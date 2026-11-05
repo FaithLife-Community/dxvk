@@ -1115,6 +1115,16 @@ namespace dxvk {
     void* MapTexture(D3D9CommonTexture* pTexture, UINT Subresource);
 
     /**
+     * \brief Waits for a readback into a texture backed by application memory and copies it there
+     */
+    void SyncUserMemoryAfterReadback(D3D9CommonTexture* pTexture);
+
+    /**
+     * \brief Copies application memory into the internal data of a texture backed by it
+     */
+    void SyncUserMemoryBeforeAccess(D3D9CommonTexture* pTexture);
+
+    /**
      * \brief Moves the texture to the front of the LRU list of mapped textures
      */
     void TouchMappedTexture(D3D9CommonTexture* pTexture);

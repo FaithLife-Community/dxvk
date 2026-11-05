@@ -326,6 +326,85 @@ namespace dxvk {
   }
 
 
+  template <bool ToUserMemory>
+  static void CopyUserMemoryRows(
+          uint8_t*                pData,
+          uint8_t*                pUser,
+    const DxvkFormatInfo*         pFormatInfo,
+          VkExtent3D              Extent) {
+    // Application memory is tightly packed, our data uses rows aligned to
+    // 4 bytes (see GetSubresourceSize). Planes of multi-planar formats
+    // follow each other and share the pitch of the first plane.
+    VkDeviceSize elementSize = pFormatInfo->elementSize;
+    VkExtent3D   blockSize   = pFormatInfo->blockSize;
+    uint32_t     planeCount  = 1;
+
+    if (unlikely(pFormatInfo->flags.test(DxvkFormatFlag::MultiPlane))) {
+      elementSize = pFormatInfo->planes[0].elementSize;
+      blockSize   = { pFormatInfo->planes[0].blockSize.width, pFormatInfo->planes[0].blockSize.height, 1u };
+      planeCount  = 2;
+    }
+
+    VkExtent3D   blockCount = util::computeBlockCount(Extent, blockSize);
+    VkDeviceSize userPitch  = blockCount.width * elementSize;
+    VkDeviceSize dataPitch  = align(userPitch, 4);
+    VkDeviceSize rowCount   = 0;
+
+    for (uint32_t i = 0; i < planeCount; i++) {
+      VkExtent3D planeBlockSize = i
+        ? VkExtent3D { blockSize.width  * pFormatInfo->planes[i].blockSize.width,
+                       blockSize.height * pFormatInfo->planes[i].blockSize.height, 1u }
+        : blockSize;
+      rowCount += util::computeBlockCount(Extent, planeBlockSize).height;
+    }
+
+    rowCount *= blockCount.depth;
+
+    if (userPitch == dataPitch) {
+      if (ToUserMemory)
+        std::memcpy(pUser, pData, userPitch * rowCount);
+      else
+        std::memcpy(pData, pUser, userPitch * rowCount);
+      return;
+    }
+
+    for (VkDeviceSize row = 0; row < rowCount; row++) {
+      if (ToUserMemory)
+        std::memcpy(pUser + row * userPitch, pData + row * dataPitch, userPitch);
+      else
+        std::memcpy(pData + row * dataPitch, pUser + row * userPitch, userPitch);
+    }
+  }
+
+
+  void D3D9CommonTexture::CopyUserMemoryToData() {
+    auto data = reinterpret_cast<uint8_t*>(GetData(0));
+
+    if (unlikely(!m_userMemory || !data))
+      return;
+
+    CopyUserMemoryRows<false>(data, reinterpret_cast<uint8_t*>(m_userMemory),
+      m_mapping.Format != VK_FORMAT_UNDEFINED
+        ? lookupFormatInfo(m_mapping.Format)
+        : m_device->UnsupportedFormatInfo(m_desc.Format),
+      GetExtentMip(0));
+  }
+
+
+  void D3D9CommonTexture::CopyDataToUserMemory() {
+    auto data = reinterpret_cast<uint8_t*>(GetData(0));
+
+    if (unlikely(!m_userMemory || !data))
+      return;
+
+    CopyUserMemoryRows<true>(data, reinterpret_cast<uint8_t*>(m_userMemory),
+      m_mapping.Format != VK_FORMAT_UNDEFINED
+        ? lookupFormatInfo(m_mapping.Format)
+        : m_device->UnsupportedFormatInfo(m_desc.Format),
+      GetExtentMip(0));
+  }
+
+
   const Rc<DxvkBuffer>& D3D9CommonTexture::EnsureBufferExists(bool Initialize) {
     if (likely(m_buffer != nullptr))
       return m_buffer;

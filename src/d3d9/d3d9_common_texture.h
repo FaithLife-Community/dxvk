@@ -161,6 +161,42 @@ namespace dxvk {
      */
     void* GetData(UINT Subresource);
 
+    /**
+     * \brief Application-provided system memory
+     *
+     * On D3D9Ex, a D3DPOOL_SYSTEMMEM texture or offscreen plain surface
+     * with a single subresource can be created on top of memory owned by
+     * the application by passing a pointer to it through pSharedHandle.
+     * On Windows that memory \e is the resource's storage, so the
+     * application may read results of GetRenderTargetData straight from
+     * it, or write into it, without ever calling LockRect.
+     *
+     * We keep using our own mapping buffer internally and copy between
+     * it and the application's memory wherever the two must agree.
+     * \returns Application memory, or \c nullptr for regular resources
+     */
+    void* GetUserMemory() const {
+      return m_userMemory;
+    }
+
+    void SetUserMemory(void* pMemory) {
+      m_userMemory = pMemory;
+    }
+
+    /**
+     * \brief Copies the application's memory into our mapping data
+     *
+     * The caller must make sure the mapping buffer is not in use by the GPU.
+     */
+    void CopyUserMemoryToData();
+
+    /**
+     * \brief Copies our mapping data into the application's memory
+     *
+     * The caller must make sure any GPU writes to the mapping buffer have completed.
+     */
+    void CopyDataToUserMemory();
+
     const Rc<DxvkBuffer>& GetBuffer() const {
       return m_buffer;
     }
@@ -531,6 +567,8 @@ namespace dxvk {
     Rc<DxvkImage>                 m_resolveImage;
     Rc<DxvkBuffer>                m_buffer;
     MemoryFileRegion              m_data = { };
+
+    void*                         m_userMemory = nullptr;
 
     D3D9SubresourceArray<
       uint64_t>                   m_seqs = { };
